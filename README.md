@@ -10,7 +10,7 @@
 An Android app that turns the display off **without** suspending the system, so every app keeps
 running in the background. Works on Android 5.1+ with only ADB (or root / Shizuku) permission.
 
-当前版本：**v23**（更新内容见 [CHANGELOG.md](CHANGELOG.md)）
+当前版本：**v24**（更新内容见 [CHANGELOG.md](CHANGELOG.md)）
 
 ## 它解决什么问题
 

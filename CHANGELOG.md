@@ -1,5 +1,29 @@
 # 更新记录
 
+## v24 — 2026-11
+
+真机实测暴露的两个阻断性 bug，都会导致**激活必定失败**。
+
+### 修复
+
+- **激活脚本被写成了 CRLF，设备端直接语法错误**
+  真机报错：`starter.sh[8]: : inaccessible or not found`、`syntax error: unmatched 'if'`。
+  原因是本机 `core.autocrlf=true`，`git add` 时把工作区脚本改写成了 CRLF，而 APK 是在那之后打包的；
+  mksh 把行尾的 `\r` 当成命令名执行，`then\r` 也不再被识别为 `then`。
+  - 新增 `.gitattributes`：`*.sh` / `gradlew` 强制 `eol=lf`，`app/src/main/assets/**` 按二进制处理不转换
+  - `unzipFiles()` 增加兜底：写 `starter.sh` 时主动把 CRLF 归一化成 LF，
+    即使构建环境有问题，装到手机上的脚本也一定是 LF
+- **Shizuku 激活报 "process hasn't exited"**
+  `Shell` 里 `process.exitValue()` 没有保护。Shizuku 的远程进程是自实现的 `Process`，
+  `waitFor()` 返回 true 后 `exitValue()` 仍可能抛 `IllegalThreadStateException`。
+  现在退出码只作为参考：拿不到时退化为解析脚本自己打印的标记（`错误：` / `已启动`）。
+- **判定逻辑改为脚本标记优先**：脚本明确报错就是失败，明确说已启动就算成功，
+  不再单纯依赖退出码——Shizuku 路径本来就拿不到可靠的退出码。
+
+### 说明
+
+v22 / v23 的 APK 里脚本同样是 CRLF，所以那两版的激活是**不可用的**，请直接装 v24。
+
 ## v23 — 2026-11
 
 把「root 激活」和「Shizuku 激活」两条路径重写成**真执行、真校验**。这两条路径 v22 里都还在，

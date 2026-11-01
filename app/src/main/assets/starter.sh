@@ -4,7 +4,9 @@
 #   adb shell sh /sdcard/Android/data/com.tile.screenoff/files/starter.sh
 # 也可以由 APP 内的「root 激活」「Shizuku 激活」按钮直接调用。
 #
-# 约定：成功 exit 0，失败 exit 非 0 并打印原因（APP 会把输出显示给用户）。
+# 约定（APP 会解析这些标记）：
+#   失败：打印以「错误：」开头的行，并 exit 非 0
+#   成功：打印包含「已启动」的行，exit 0
 
 PKG=com.tile.screenoff
 DEX_NAME=ScreenController.dex

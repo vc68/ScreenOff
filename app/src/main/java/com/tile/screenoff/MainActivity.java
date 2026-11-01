@@ -831,7 +831,7 @@ public class MainActivity extends Activity {
 
         File scriptFile = new File(dir, "starter.sh");
         try (InputStream is = getAssets().open("starter.sh")) {
-            copy(is, scriptFile);
+            copyShellScript(is, scriptFile);
         } catch (IOException ignored) {
         }
 
@@ -855,6 +855,32 @@ public class MainActivity extends Activity {
             while ((len = is.read(buffer)) > 0) {
                 os.write(buffer, 0, len);
             }
+            os.flush();
+        }
+    }
+
+    /**
+     * 写激活脚本时把换行统一成 LF。
+     * <p>
+     * Windows 上 core.autocrlf=true 会把 assets 里的脚本改写成 CRLF，设备端 mksh 会报
+     * "syntax error: unmatched 'if'" 和 ": inaccessible or not found"。
+     * 除了 .gitattributes 约束仓库，这里再做一层兜底，确保发出去的脚本一定是 LF。
+     */
+    private static void copyShellScript(InputStream is, File target) throws IOException {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        byte[] chunk = new byte[4096];
+        int len;
+        while ((len = is.read(chunk)) > 0) {
+            buffer.write(chunk, 0, len);
+        }
+        byte[] data = buffer.toByteArray();
+        ByteArrayOutputStream out = new ByteArrayOutputStream(data.length);
+        for (int i = 0; i < data.length; i++) {
+            if (data[i] == '\r' && i + 1 < data.length && data[i + 1] == '\n') continue;
+            out.write(data[i]);
+        }
+        try (OutputStream os = new FileOutputStream(target)) {
+            os.write(out.toByteArray());
             os.flush();
         }
     }
