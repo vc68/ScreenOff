@@ -44,4 +44,10 @@
     <string name="net_failed">局域網控製啟動失敗（端口被占用）</string>
     <string name="active_success">激活成功</string>
     <string name="version_info">版本 %1$s</string>
+    <string name="activating">正在激活，請稍候…</string>
+    <string name="activate_timeout">命令已執行，但息屏服務沒有響應。請確認：\n1. 是否在彈出的授權框裡點了「允許」\n2. 手機是否已 root / Shizuku 是否在運行\n3. 重新打開本頁面再試一次</string>
+    <string name="active_failed_tip">激活失敗：APP 未能釋放激活腳本或 dex，請確認存儲空間正常後重試。</string>
+    <string name="shizuku_missing">未檢測到 Shizuku，請先安裝並啟動 Shizuku</string>
+    <string name="shizuku_denied">Shizuku 權限被拒絕。請在 Shizuku 裡允許本應用，或重新點一次「Shizuku激活」。</string>
+    <string name="shizuku_need_m">Shizuku 激活需要 Android 6.0 及以上</string>
 </resources>

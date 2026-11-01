@@ -29,6 +29,7 @@ import android.os.RemoteException;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.TextWatcher;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.Window;
@@ -46,7 +47,7 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.DataOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -56,8 +57,10 @@ import java.lang.reflect.Method;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.nio.charset.StandardCharsets;
 import java.util.Enumeration;
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -67,8 +70,14 @@ public class MainActivity extends Activity {
 
     private static final String TAG = "ScreenOff";
 
+    /** 激活命令最长等待时间（root 授权弹窗可能停留较久） */
+    private static final long ACTIVATE_TIMEOUT_MS = 20000;
+    /** 命令执行成功后，等待 Binder 连上的最长时间 */
+    private static final long BINDER_WAIT_MS = 10000;
+
     private boolean isExpand = false, isServiceOK = false, isPermissionResultListenerRegistered = false;
-    private boolean receiverRegistered = false, updatingSwitch = false;
+    private boolean receiverRegistered = false, updatingSwitch = false, activating = false;
+    private AlertDialog activateDialog;
     private int scrOffKey, scrOnKey;
     private IScreenOff iScreenOff = null;
     private SharedPreferences sp;
@@ -538,56 +547,73 @@ public class MainActivity extends Activity {
 
     /** 检查并申请 Shizuku 权限，拿到权限后用 Shizuku 启动 shell 脚本。 */
     private void check() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            Toast.makeText(this, R.string.shizuku_need_m, Toast.LENGTH_SHORT).show();
+            return;
+        }
         ensurePermissionListener();
         try {
+            if (!Shizuku.pingBinder()) {
+                Toast.makeText(this, R.string.shizuku_missing, Toast.LENGTH_SHORT).show();
+                return;
+            }
             if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-                Shizuku.requestPermission(0);
+                if (Shizuku.shouldShowRequestPermissionRationale()) {
+                    new AlertDialog.Builder(this)
+                            .setTitle(R.string.need_active)
+                            .setMessage(R.string.shizuku_denied)
+                            .setPositiveButton(R.string.understand, (d, i) -> Shizuku.requestPermission(0))
+                            .setNegativeButton(R.string.disagree, null)
+                            .show();
+                } else {
+                    Shizuku.requestPermission(0);
+                }
                 return;
             }
             activateByShizuku();
         } catch (IllegalStateException e) {
             Toast.makeText(this, R.string.shizuku_notrun, Toast.LENGTH_SHORT).show();
         } catch (Throwable t) {
-            // 老版本 Shizuku 没有 checkSelfPermission，退回到直接检查权限
+            // 老版本 Shizuku（pre-v11）没有 checkSelfPermission，退回到直接检查权限
             try {
                 if (checkSelfPermission("moe.shizuku.manager.permission.API_V23") == PackageManager.PERMISSION_GRANTED) {
                     activateByShizuku();
                 } else {
-                    Toast.makeText(this, R.string.shizuku_notrun, Toast.LENGTH_SHORT).show();
+                    Shizuku.requestPermission(0);
                 }
             } catch (Throwable ignored) {
-                Toast.makeText(this, R.string.active_failed, Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, R.string.shizuku_missing, Toast.LENGTH_SHORT).show();
             }
         }
     }
 
     private void activateByShizuku() {
-        final File dir = getExternalFilesDir(null);
-        if (dir == null) {
-            Toast.makeText(this, R.string.active_failed, Toast.LENGTH_SHORT).show();
-            return;
-        }
-        unzipFiles();
-        final String script = dir.getAbsolutePath() + "/starter.sh";
-        try {
+        final String script = ensureScriptReady();
+        if (script == null) return;
+        runActivate("shizuku", () -> {
+            if (!Shizuku.pingBinder()) throw new IllegalStateException(getString(R.string.shizuku_notrun));
             Process process = newShizukuProcess(new String[]{"sh", script});
-            if (process == null) throw new IOException("newProcess returned null");
-            process.waitFor();
-            Toast.makeText(this, R.string.active_success, Toast.LENGTH_SHORT).show();
-            handler.postDelayed(this::refreshBinder, 1200);
-        } catch (Throwable e) {
-            Toast.makeText(this, R.string.active_failed, Toast.LENGTH_SHORT).show();
-        }
+            if (process == null) throw new IOException("newProcess 返回 null");
+            return Shell.waitAndCollect(process, ACTIVATE_TIMEOUT_MS);
+        });
     }
 
     /**
      * Shizuku 13.1.5 起把 newProcess 改成了私有方法，这里用反射调用，
      * 拿到的 ShizukuRemoteProcess 本身就是 Process 的子类。
+     * 先按 public 找，找不到再按 declared 找，兼容新旧版本。
      */
     private static Process newShizukuProcess(String[] command) throws Exception {
-        Method method = Shizuku.class.getDeclaredMethod("newProcess", String[].class, String[].class, String.class);
-        method.setAccessible(true);
+        Method method;
+        try {
+            method = Shizuku.class.getMethod("newProcess", String[].class, String[].class, String.class);
+        } catch (NoSuchMethodException e) {
+            method = Shizuku.class.getDeclaredMethod("newProcess", String[].class, String[].class, String.class);
+            try {
+                method.setAccessible(true);
+            } catch (Throwable ignored) {
+            }
+        }
         return (Process) method.invoke(null, command, null, null);
     }
 
@@ -636,13 +662,9 @@ public class MainActivity extends Activity {
     }
 
     public void showActivate() {
-        unzipFiles();
-        final File dir = getExternalFilesDir(null);
-        if (dir == null) {
-            Toast.makeText(this, R.string.active_failed, Toast.LENGTH_SHORT).show();
-            return;
-        }
-        final String command = "sh " + dir.getAbsolutePath() + "/starter.sh";
+        final String script = ensureScriptReady();
+        if (script == null) return;
+        final String command = "sh " + script;
         AlertDialog.Builder builder = new AlertDialog.Builder(MainActivity.this)
                 .setMessage(String.format(getString(R.string.active_steps), command))
                 .setTitle(R.string.need_active)
@@ -655,21 +677,151 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             builder.setPositiveButton(R.string.by_shizuku, (dialogInterface, i) -> check());
         }
-        builder.show();
+        activateDialog = builder.show();
     }
 
-    private void activateByRoot(String command) {
+    /** root 激活：优先 su -c；部分 su 实现不支持 -c（返回非 0），再用 stdin 喂命令重试一次。 */
+    private void activateByRoot(final String command) {
+        runActivate("root", () -> runAsRoot(command));
+    }
+
+    private String runAsRoot(String command) throws Exception {
+        IOException firstError;
         try {
-            Process p = Runtime.getRuntime().exec("su");
-            DataOutputStream out = new DataOutputStream(p.getOutputStream());
-            out.writeBytes(command + "\nexit\n");
-            out.flush();
-            out.close();
-            Toast.makeText(this, R.string.active_success, Toast.LENGTH_SHORT).show();
-            handler.postDelayed(this::refreshBinder, 1500);
+            Process p = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
+            return Shell.waitAndCollect(p, ACTIVATE_TIMEOUT_MS);
+        } catch (Shell.Timeout e) {
+            // 超时说明 su 正在等用户授权，不要重试，否则会连弹两次授权框
+            throw e;
         } catch (IOException e) {
-            Toast.makeText(this, R.string.active_failed, Toast.LENGTH_SHORT).show();
+            // 只有「su 不认识 -c」才值得换一种方式重试；
+            // 用户点了「拒绝」也会返回非 0，那种情况必须直接失败，不能再来一次。
+            if (!looksLikeUnsupportedOption(e.getMessage())) throw e;
+            firstError = e;
+            Log.w(TAG, "su -c 不被支持，改用 stdin 重试", e);
         }
+
+        Process p = new ProcessBuilder("su").redirectErrorStream(true).start();
+        try (OutputStream os = p.getOutputStream()) {
+            os.write((command + "\nexit\n").getBytes(StandardCharsets.UTF_8));
+            os.flush();
+        }
+        try {
+            return Shell.waitAndCollect(p, ACTIVATE_TIMEOUT_MS);
+        } catch (IOException second) {
+            throw new IOException(describe(firstError) + "\n--- 重试 ---\n" + second.getMessage());
+        }
+    }
+
+    private static boolean looksLikeUnsupportedOption(String message) {
+        if (message == null) return false;
+        String m = message.toLowerCase(Locale.US);
+        return m.contains("invalid option") || m.contains("unknown option") || m.contains("usage");
+    }
+
+    // ------------------------------------------------------------------ 激活流程
+
+    private interface ShellRunner {
+        String run() throws Exception;
+    }
+
+    /**
+     * 执行激活命令并**真正校验结果**：
+     * 1. 后台线程跑命令，拿退出码和输出；
+     * 2. 退出码非 0 或超时，直接失败并展示原始输出；
+     * 3. 退出码为 0 还要等 Binder 真的连上才算成功（最多 10 秒）。
+     */
+    private void runActivate(final String label, final ShellRunner runner) {
+        if (activating) {
+            Toast.makeText(this, R.string.activating, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        activating = true;
+        Toast.makeText(this, R.string.activating, Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            String detail;
+            boolean commandOk;
+            try {
+                String output = runner.run();
+                commandOk = true;
+                detail = output;
+                Log.i(TAG, "activate[" + label + "] output: " + output);
+            } catch (Throwable t) {
+                commandOk = false;
+                detail = describe(t);
+                Log.w(TAG, "activate[" + label + "] failed", t);
+            }
+            final boolean ok = commandOk;
+            final String message = detail;
+            handler.post(() -> {
+                if (ok) {
+                    awaitBinderThenFinish(System.currentTimeMillis() + BINDER_WAIT_MS, message);
+                } else {
+                    activating = false;
+                    showActivateFailure(message);
+                }
+            });
+        }, "activate-" + label).start();
+    }
+
+    private static String describe(Throwable t) {
+        String msg = t.getMessage();
+        if (msg == null || msg.isEmpty()) msg = t.getClass().getSimpleName();
+        if (t instanceof IOException && msg.contains("Cannot run program")) {
+            return "su 不可用（设备未 root 或未授予 root 权限）";
+        }
+        return msg;
+    }
+
+    /** 命令成功后轮询 Binder，直到服务真正连上或超时。 */
+    private void awaitBinderThenFinish(final long deadline, final String output) {
+        if (isServiceOK) {
+            onActivateSuccess();
+            return;
+        }
+        if (System.currentTimeMillis() > deadline) {
+            activating = false;
+            showActivateFailure(getString(R.string.activate_timeout) + Shell.appendOutput(output));
+            return;
+        }
+        registerBinderReceiver(); // 重新注册可再次收到粘性广播里的 Binder
+        handler.postDelayed(() -> awaitBinderThenFinish(deadline, output), 500);
+    }
+
+    private void onActivateSuccess() {
+        activating = false;
+        if (activateDialog != null && activateDialog.isShowing()) {
+            activateDialog.dismiss();
+        }
+        Toast.makeText(this, R.string.active_success, Toast.LENGTH_SHORT).show();
+        refreshBinder();
+    }
+
+    private void showActivateFailure(String detail) {
+        String message = (detail == null || detail.trim().isEmpty())
+                ? getString(R.string.active_failed_tip) : detail;
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.active_failed)
+                .setMessage(message)
+                .setPositiveButton(R.string.understand, null)
+                .show();
+    }
+
+    /** 释放脚本和 dex，返回 starter.sh 的绝对路径；失败返回 null 并提示。 */
+    private String ensureScriptReady() {
+        File dir = getExternalFilesDir(null);
+        if (dir == null) {
+            Toast.makeText(this, R.string.active_failed_tip, Toast.LENGTH_SHORT).show();
+            return null;
+        }
+        unzipFiles();
+        File script = new File(dir, "starter.sh");
+        File dex = new File(dir, "ScreenController.dex");
+        if (!script.exists() || !dex.exists() || dex.length() == 0) {
+            Toast.makeText(this, R.string.active_failed_tip, Toast.LENGTH_SHORT).show();
+            return null;
+        }
+        return script.getAbsolutePath();
     }
 
     /** 把 starter.sh 和 classes.dex 释放到外部目录，供 shell 读取。 */
