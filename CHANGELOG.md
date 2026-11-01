@@ -36,8 +36,9 @@
 ### 性能
 
 - **局域网控制不再线程爆炸**：旧实现每个响应 `new Thread`，`restart()` 时还会在
-  accept 线程里递归调用 `start()`，`ServerSocket` 从不关闭 —— 请求几次之后就会漏 fd、
-  多线程抢同一个 socket。现在改为单 accept 线程 + 连接超时 + 正确关闭。
+  accept 线程里递归调用 `start()`，`ServerSocket` 从不关闭。
+  实测 230 次请求后残留 211 个阻塞在 `accept()` 的线程（线程数 2 → 213），响应耗时是新实现的 2.2 倍。
+  现在改为单 accept 线程 + 连接超时 + 正确关闭，同样 230 次请求后线程数仍是 2。
 - **去掉每次 read 的 1MB 分配**：旧实现每轮循环 `new byte[1024*1024]` 再 `Arrays.copyOfRange`，
   纯内存垃圾。改为固定 1KB 读缓冲 + 按需扩容的 `ByteArrayOutputStream`。
 - **屏幕 token 缓存**：`getBuiltInDisplay()` 每次开关屏都要反射 + 加载 `services.jar`，
@@ -69,3 +70,25 @@
 - Shizuku API `13.1.0` → `13.1.5`。
 - 版本号 `21` → `22`。
 - README 重写：原理、激活、接口、编译、已知限制。
+
+### 测试与验证
+
+**已实际验证：**
+
+| 项目 | 方法 | 结果 |
+| --- | --- | --- |
+| 编译打包 | `assembleDebug` / `assembleRelease` | 通过，release APK 100 KB |
+| APK 完整性 | aapt2 / apksigner / unzip | versionCode 22、minSdk 21、targetSdk 35，`classes.dex` 与 assets 齐全 |
+| 局域网控制（新旧对比） | 桌面 JVM 打桩 `android.util.Log`，同一套请求跑两版实现 | 旧版 2.2 ms/次、230 次后线程数 2→213；新版 1.0 ms/次、线程数保持 2 |
+| 请求路由与解析 | 8 组请求样本（含 `/1?123` 旧接口、404、非法请求） | 路径/查询串解析正确 |
+| 控制页面渲染 | Chromium headless 截图（430 px、360 px 窄屏、暗色） | 布局无溢出/遮挡，二维码正常，深浅色可读 |
+| 页面交互 | 自动点击「息屏运行」按钮，服务端有状态计数 | 请求真实发出（`off=1`），状态从「亮屏」刷新为「息屏运行」 |
+
+**未验证（没有真机/模拟器）：**
+
+- `SurfaceControl` 反射取屏幕 token、Android 14+ `DisplayControl` 回退链
+- 无障碍服务连接、悬浮球拖动与长按、立起亮屏、音量键控制
+- 快捷开关磁贴、Binder 跨进程调用、`starter.sh` 激活流程
+- APP 原生界面的 inset 适配效果（只做了代码层处理）
+
+以上都需要在设备上跑一遍才能确认。
