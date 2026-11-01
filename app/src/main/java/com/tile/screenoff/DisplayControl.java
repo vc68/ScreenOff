@@ -4,12 +4,16 @@ import android.annotation.SuppressLint;
 import android.os.IBinder;
 import android.util.Log;
 
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
+/**
+ * 通过加载 services.jar 里的 com.android.server.display.DisplayControl 拿到物理屏幕 token。
+ * Android 14 起 SurfaceControl.getInternalDisplayToken 被隐藏，只能走这条路。
+ */
 @SuppressLint({"PrivateApi", "SoonBlockedPrivateApi", "BlockedPrivateApi"})
-//@TargetApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public final class DisplayControl {
+
+    private static final String TAG = "ScreenOff";
 
     private static final Class<?> CLASS;
 
@@ -17,9 +21,11 @@ public final class DisplayControl {
         Class<?> displayControlClass = null;
         try {
             Class<?> classLoaderFactoryClass = Class.forName("com.android.internal.os.ClassLoaderFactory");
-            Method createClassLoaderMethod = classLoaderFactoryClass.getDeclaredMethod("createClassLoader", String.class, String.class, String.class,
+            Method createClassLoaderMethod = classLoaderFactoryClass.getDeclaredMethod("createClassLoader",
+                    String.class, String.class, String.class,
                     ClassLoader.class, int.class, boolean.class, String.class);
-            ClassLoader classLoader = (ClassLoader) createClassLoaderMethod.invoke(null, "/system/framework/services.jar", null, null,
+            ClassLoader classLoader = (ClassLoader) createClassLoaderMethod.invoke(null,
+                    "/system/framework/services.jar", null, null,
                     ClassLoader.getSystemClassLoader(), 0, true, null);
 
             displayControlClass = classLoader.loadClass("com.android.server.display.DisplayControl");
@@ -27,9 +33,8 @@ public final class DisplayControl {
             Method loadMethod = Runtime.class.getDeclaredMethod("loadLibrary0", Class.class, String.class);
             loadMethod.setAccessible(true);
             loadMethod.invoke(Runtime.getRuntime(), displayControlClass, "android_servers");
-        } catch (Throwable e) {
-            Log.e("Could not initialize DisplayControl", e.getMessage());
-            // Do not throw an exception here, the methods will fail when they are called
+        } catch (Throwable t) {
+            Log.w(TAG, "could not initialize DisplayControl: " + t);
         }
         CLASS = displayControlClass;
     }
@@ -38,42 +43,35 @@ public final class DisplayControl {
     private static Method getPhysicalDisplayIdsMethod;
 
     private DisplayControl() {
-        // only static methods
     }
 
-    private static Method getGetPhysicalDisplayTokenMethod() throws NoSuchMethodException {
-        if (getPhysicalDisplayTokenMethod == null) {
-            getPhysicalDisplayTokenMethod = CLASS.getMethod("getPhysicalDisplayToken", long.class);
-        }
-        return getPhysicalDisplayTokenMethod;
+    public static boolean isAvailable() {
+        return CLASS != null;
     }
 
     public static IBinder getPhysicalDisplayToken(long physicalDisplayId) {
+        if (CLASS == null) return null;
         try {
-            Method method = getGetPhysicalDisplayTokenMethod();
-            return (IBinder) method.invoke(null, physicalDisplayId);
-        } catch (InvocationTargetException | IllegalAccessException | NoSuchMethodException e) {
-            Log.e("Could not invoke method", e.getMessage());
+            if (getPhysicalDisplayTokenMethod == null) {
+                getPhysicalDisplayTokenMethod = CLASS.getMethod("getPhysicalDisplayToken", long.class);
+            }
+            return (IBinder) getPhysicalDisplayTokenMethod.invoke(null, physicalDisplayId);
+        } catch (Throwable t) {
+            Log.w(TAG, "getPhysicalDisplayToken failed: " + t);
             return null;
         }
     }
 
-    private static Method getGetPhysicalDisplayIdsMethod() throws NoSuchMethodException {
-        if (getPhysicalDisplayIdsMethod == null) {
-            getPhysicalDisplayIdsMethod = CLASS.getMethod("getPhysicalDisplayIds");
-        }
-        return getPhysicalDisplayIdsMethod;
-    }
-
     public static long[] getPhysicalDisplayIds() {
+        if (CLASS == null) return null;
         try {
-            Method method = getGetPhysicalDisplayIdsMethod();
-            //return method;
-            return (long[]) method.invoke(null);
-            } catch (InvocationTargetException | IllegalAccessException | NoSuchMethodException e) {
-                    Log.e("Could not invoke method", String.valueOf(e));
-                    return null;
-                }
-
+            if (getPhysicalDisplayIdsMethod == null) {
+                getPhysicalDisplayIdsMethod = CLASS.getMethod("getPhysicalDisplayIds");
+            }
+            return (long[]) getPhysicalDisplayIdsMethod.invoke(null);
+        } catch (Throwable t) {
+            Log.w(TAG, "getPhysicalDisplayIds failed: " + t);
+            return null;
+        }
     }
 }

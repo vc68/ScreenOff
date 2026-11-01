@@ -5,15 +5,18 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
 
     <uses-sdk tools:overrideLibrary="rikka.shizuku.provider,rikka.shizuku.api,rikka.shizuku.shared,rikka.shizuku.aidl" />
 
     <application
+        android:allowBackup="false"
+        android:enableOnBackInvokedCallback="false"
         android:icon="@mipmap/icon"
         android:label="@string/shortcutoff"
+        android:supportsRtl="true"
         android:theme="@style/AppTheme">
+
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|keyboard|keyboardHidden"
@@ -29,9 +32,11 @@
                 android:name="android.app.shortcuts"
                 android:resource="@xml/shortcuts" />
         </activity>
+
         <service
             android:name=".GlobalService"
             android:exported="true"
+            android:label="@string/tile"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
@@ -40,6 +45,7 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/a" />
         </service>
+
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
@@ -48,11 +54,11 @@
             android:multiprocess="false"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
-
         <service
             android:name=".tileService"
             android:exported="true"
             android:icon="@drawable/tile"
+            android:label="@string/tile"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
@@ -62,14 +68,19 @@
                 android:value="true" />
         </service>
 
+        <!-- 用透明主题而不是 NoDisplay，避免在部分系统上因未及时 finish 而崩溃 -->
         <activity
             android:name=".ScrOff"
             android:excludeFromRecents="true"
-            android:exported="true" />
+            android:exported="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <activity
             android:name=".ScrOn"
             android:excludeFromRecents="true"
-            android:exported="true" />
+            android:exported="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>
 
 </manifest>

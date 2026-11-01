@@ -5,132 +5,181 @@ import android.content.IIntentReceiver;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.RemoteException;
 import android.util.Log;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
-import java.util.Scanner;
 
+/**
+ * 以 shell(uid 2000) 或 root(uid 0) 身份运行的后台进程。
+ * 通过反射调用 SurfaceControl 关闭/打开物理屏幕，并把一个 Binder 用粘性广播交给 App。
+ * <p>
+ * 用法（一般由 starter.sh 调起）：
+ * app_process /system/bin com.tile.screenoff.ScreenController [--off|--on|--toggle|--state]
+ * 不带参数时作为常驻服务运行。
+ */
 public class ScreenController {
 
-
-    //发送广播需要的三个东西
-    static boolean isBroadcastSent = false;
-    static Intent intent = null;
-    static Object iActivityManagerObj = null;
-
+    private static final String TAG = "ScreenOff";
+    private static final String ACTION_SEND_BINDER = "intent.screenoff.sendBinder";
 
     public enum ScreenState {
         STATE_OFF, STATE_ON, STATE_SPECIAL
     }
 
-    static ScreenState screenState = ScreenState.STATE_ON;
-
-
-    private static final Class<?> CLASS;
     public static final int POWER_MODE_OFF = 0;
     public static final int POWER_MODE_NORMAL = 2;
 
+    private static final Class<?> SURFACE_CONTROL_CLASS;
+
     static {
+        Class<?> clazz = null;
         try {
-            CLASS = Class.forName("android.view.SurfaceControl");
-        } catch (ClassNotFoundException e) {
-            throw new AssertionError(e);
+            clazz = Class.forName("android.view.SurfaceControl");
+        } catch (Throwable t) {
+            Log.e(TAG, "SurfaceControl not found", t);
         }
+        SURFACE_CONTROL_CLASS = clazz;
     }
-    public static boolean useDisplayControl =
-            Build.VERSION.SDK_INT >= 34;
-    private static Method getBuiltInDisplayMethod;
+
+    private static volatile ScreenState screenState = ScreenState.STATE_ON;
+    private static volatile IBinder displayToken;
+
     private static Method setDisplayPowerModeMethod;
-    private static boolean listenVolumeKey = false;
-    static Thread h1;
-    static Process listenVolumeKeyProcess;
 
-    private static Method getGetBuiltInDisplayMethod() throws NoSuchMethodException {
-        if (getBuiltInDisplayMethod == null)
-            getBuiltInDisplayMethod = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ? CLASS.getMethod("getBuiltInDisplay", int.class) : CLASS.getMethod("getInternalDisplayToken");
-        return getBuiltInDisplayMethod;
+    private static boolean isBroadcastSent = false;
+    private static Intent binderIntent = null;
+    private static Object activityManager = null;
+
+    // ------------------------------------------------------------------ 显示控制
+
+    /** 取得物理屏幕 token，带缓存，避免每次开关屏都重新反射/加载 services.jar。 */
+    private static IBinder getDisplayToken() {
+        IBinder token = displayToken;
+        if (token != null && token.pingBinder()) return token;
+        token = resolveDisplayToken();
+        displayToken = token;
+        return token;
     }
 
-    public static IBinder getBuiltInDisplay() {
-        try {
-            // Change the power mode for all physical displays
-            Log.e("getBuiltInDisplay","Android 14" + useDisplayControl);
-            if (useDisplayControl) {
-                long[] physicalDisplayIds = DisplayControl.getPhysicalDisplayIds();
-                if (physicalDisplayIds == null) {
-                    Log.e("getBuiltInDisplay", "Could not get physical display ids");
-                    return null;
+    private static IBinder resolveDisplayToken() {
+        // Android 14 起 getInternalDisplayToken 被隐藏，改用 DisplayControl
+        if (Build.VERSION.SDK_INT >= 34) {
+            try {
+                long[] ids = DisplayControl.getPhysicalDisplayIds();
+                if (ids != null && ids.length > 0) {
+                    IBinder token = DisplayControl.getPhysicalDisplayToken(ids[0]);
+                    if (token != null) return token;
                 }
-
-                for (long physicalDisplayId : physicalDisplayIds) {
-                    return DisplayControl.getPhysicalDisplayToken(
-                            physicalDisplayId);
-
-                }
-            } else {
-                Method method = getGetBuiltInDisplayMethod();
-                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                    // call getBuiltInDisplay(0)
-                    return (IBinder) method.invoke(null, 0);
-                }
-
-                // call getInternalDisplayToken()
-                return (IBinder) method.invoke(null);
+            } catch (Throwable t) {
+                Log.w(TAG, "DisplayControl unavailable, falling back", t);
             }
-        } catch(InvocationTargetException | IllegalAccessException | NoSuchMethodException e){
-            Log.e("Could not invoke method", String.valueOf(e));
+        }
+        if (SURFACE_CONTROL_CLASS == null) return null;
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                Method method = SURFACE_CONTROL_CLASS.getMethod("getBuiltInDisplay", int.class);
+                return (IBinder) method.invoke(null, 0);
+            }
+            Method method = SURFACE_CONTROL_CLASS.getMethod("getInternalDisplayToken");
+            return (IBinder) method.invoke(null);
+        } catch (Throwable t) {
+            Log.e(TAG, "could not get display token", t);
             return null;
         }
-        return null;
     }
 
-    private static Method getSetDisplayPowerModeMethod() throws NoSuchMethodException {
-        if (setDisplayPowerModeMethod == null)
-            setDisplayPowerModeMethod = CLASS.getMethod("setDisplayPowerMode", IBinder.class, int.class);
-        return setDisplayPowerModeMethod;
+    private static Method getSetDisplayPowerModeMethod() {
+        Method method = setDisplayPowerModeMethod;
+        if (method == null && SURFACE_CONTROL_CLASS != null) {
+            try {
+                method = SURFACE_CONTROL_CLASS.getMethod("setDisplayPowerMode", IBinder.class, int.class);
+                setDisplayPowerModeMethod = method;
+            } catch (Throwable t) {
+                Log.e(TAG, "setDisplayPowerMode not found", t);
+            }
+        }
+        return method;
     }
 
-    public static void setDisplayPowerMode(IBinder displayToken, int mode) {
+    private static boolean setDisplayPowerMode(IBinder token, int mode) {
+        if (token == null) return false;
+        Method method = getSetDisplayPowerModeMethod();
+        if (method == null) return false;
         try {
-            Method method = getSetDisplayPowerModeMethod();
-            method.invoke(null, displayToken, mode);
-        } catch (InvocationTargetException | IllegalAccessException |
-                 NoSuchMethodException ignored) {
+            method.invoke(null, token, mode);
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "setDisplayPowerMode failed", t);
+            return false;
         }
     }
 
-    public static void main(String[] args) {
+    /** 直接应用一次开关屏（供命令行与 Binder 共用）。 */
+    private static boolean applyPowerMode(boolean turnOff) {
+        IBinder token = getDisplayToken();
+        if (token == null) {
+            System.err.println("Could not get display token.");
+            return false;
+        }
+        if (turnOff) {
+            if (screenState == ScreenState.STATE_ON) {
+                if (!setDisplayPowerMode(token, POWER_MODE_OFF)) return false;
+                screenState = ScreenState.STATE_SPECIAL;
+            }
+        } else {
+            if (screenState == ScreenState.STATE_SPECIAL) {
+                if (!setDisplayPowerMode(token, POWER_MODE_NORMAL)) return false;
+                screenState = ScreenState.STATE_ON;
+            }
+        }
+        return true;
+    }
 
+    // ------------------------------------------------------------------ 入口
+
+    public static void main(String[] args) {
         if (Looper.getMainLooper() == null) {
             Looper.prepareMainLooper();
         }
 
-        Log.e("getBuiltInDisplay", "Android 14" + useDisplayControl);
-        //检查权限
         int uid = android.os.Process.myUid();
         if (uid != 0 && uid != 2000) {
-            System.err.printf("Insufficient permission! Need to be launched by adb (uid 2000) or root (uid 0), but your uid is %d \n", uid);
+            System.err.printf("Insufficient permission! Need to be launched by adb (uid 2000) or root (uid 0), but your uid is %d\n", uid);
             System.exit(-1);
             return;
         }
 
+        String command = args != null && args.length > 0 ? args[0] : "";
+        switch (command) {
+            case "--off":
+                System.exit(applyPowerMode(true) ? 0 : 1);
+                return;
+            case "--on":
+                System.exit(applyPowerMode(false) ? 0 : 1);
+                return;
+            case "--toggle":
+                System.exit(applyPowerMode(screenState != ScreenState.STATE_SPECIAL) ? 0 : 1);
+                return;
+            case "--state":
+                System.out.println(screenState.name());
+                System.exit(0);
+                return;
+            default:
+                break;
+        }
+
         System.out.println("Start ScreenController Service.");
 
-        isBroadcastSent = sendBinderToAppByStickyBroadcast();//发送广播，将binder传给APP
+        isBroadcastSent = sendBinderToAppByStickyBroadcast();
         if (!isBroadcastSent) {
             System.err.println("Failed to send broadcast!");
             System.exit(-1);
             return;
         }
 
-        //加入JVM异常关闭时的处理程序
         Runtime.getRuntime().addShutdownHook(new Thread() {
             @Override
             public void run() {
@@ -138,186 +187,151 @@ public class ScreenController {
             }
         });
 
-//        try {
-//            Scanner scanner = new Scanner(System.in);
-//            //用来保持进程不退出，同时如果用户输入exit则程序退出
-//            String inline;
-//            while ((inline = scanner.nextLine()) != null) {
-//                if (inline.equals("exit"))
-//                    break;
-//            }
-//            scanner.close();
-//        } catch (Exception unused) {
-//            //用户使用nohup命令启动，scanner捕捉不到任何输入,会抛出异常。
-//            while (true) ;
-//        }
-
         Looper.loop();
-
 
         if (isBroadcastSent) isBroadcastSent = !removeStickyBroadcast();
         System.out.println("Stop ScreenController Service.\n");
         System.exit(0);
     }
 
-    private static void stopListenVolumeKey() {
-        listenVolumeKey = false;
-        if (Build.VERSION.SDK_INT >= 26) {
-            listenVolumeKeyProcess.destroyForcibly();
-        } else {
-            listenVolumeKeyProcess.destroy();
+    // ------------------------------------------------------------------ Binder
+
+    private static final class ScreenOffBinder extends IScreenOff.Stub {
+        @Override
+        public void setPowerMode(boolean turnOff) throws RemoteException {
+            applyPowerMode(turnOff);
         }
-        new Handler().postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                h1.interrupt();
-            }
-        }, 2000);
-    }
 
-    private static void startListenVolumeKey() {
-        if (listenVolumeKey) return;
-        listenVolumeKey = true;
-        h1 = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    listenVolumeKeyProcess = Runtime.getRuntime().exec("getevent");
-                    BufferedReader mReader = new BufferedReader(new InputStreamReader(listenVolumeKeyProcess.getInputStream()));
-                    String inline;
-                    while ((inline = mReader.readLine()) != null) {
-                        if (!listenVolumeKey) break;
-                        if (inline.endsWith("0000 0000 00000000")) continue;
-                        if (inline.endsWith("0001 0072 00000001") || inline.endsWith("0001 0073 00000001")) {
+        @Override
+        public int getNowScreenState() throws RemoteException {
+            return screenState.ordinal();
+        }
 
-                            setDisplayPowerMode(getBuiltInDisplay(), POWER_MODE_NORMAL);
-                        }
-                    }
-                    mReader.close();
-                    listenVolumeKeyProcess.waitFor();
-                    if (Build.VERSION.SDK_INT >= 26) {
-                        listenVolumeKeyProcess.destroyForcibly();
-                    } else {
-                        listenVolumeKeyProcess.destroy();
-                    }
-                } catch (Exception ignored) {
-                }
-            }
-        });
-        h1.start();
+        @Override
+        public void updateNowScreenState(boolean isScreenOn) throws RemoteException {
+            screenState = isScreenOn ? ScreenState.STATE_ON : ScreenState.STATE_OFF;
+        }
+
+        @Override
+        public void closeAndExit() throws RemoteException {
+            if (isBroadcastSent) isBroadcastSent = !removeStickyBroadcast();
+            System.out.println("Stop ScreenController Service.\n");
+            System.exit(0);
+        }
     }
 
     private static boolean sendBinderToAppByStickyBroadcast() {
-
         try {
-            //生成binder
-            IBinder binder = new IScreenOff.Stub() {
-                @Override
-                public void setPowerMode(boolean turnOff) throws RemoteException {
-                    if (turnOff) {
-                        if (screenState == ScreenState.STATE_ON) {
-                            setDisplayPowerMode(getBuiltInDisplay(), POWER_MODE_OFF);
-//                            setDisplayPowerMode(getBuiltInDisplay(), POWER_MODE_NORMAL);
-                            screenState = ScreenState.STATE_SPECIAL;
-                        }
-                    } else {
-                        if (screenState == ScreenState.STATE_SPECIAL) {
-                            setDisplayPowerMode(getBuiltInDisplay(), POWER_MODE_NORMAL);
-                            screenState = ScreenState.STATE_ON;
-                        }
-                    }
-                }
+            IBinder binder = new ScreenOffBinder();
+            BinderContainer container = new BinderContainer(binder);
 
-                @Override
-                public int getNowScreenState() throws RemoteException {
-                    return screenState.ordinal();
-                }
+            binderIntent = new Intent(ACTION_SEND_BINDER);
+            binderIntent.putExtra("binder", container);
 
-                @Override
-                public void updateNowScreenState(boolean isScreenOn) throws RemoteException {
-                    screenState = isScreenOn ? ScreenState.STATE_ON : ScreenState.STATE_OFF;
-                }
-
-                @Override
-                public void closeAndExit() throws RemoteException {
-                    if (isBroadcastSent) isBroadcastSent = !removeStickyBroadcast();
-                    System.out.println("Stop ScreenController Service.\n");
-                    System.exit(0);
-                }
-
-            };
-
-            //把binder填到一个可以用Intent来传递的容器中
-            BinderContainer binderContainer = new BinderContainer(binder);
-            // 创建 Intent 对象，并将binder作为附加参数
-            intent = new Intent("intent.screenoff.sendBinder");
-            intent.putExtra("binder", binderContainer);
-
-            // 获取 IActivityManager 类
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                iActivityManagerObj = Class.forName("android.app.IActivityManager$Stub").getMethod("asInterface", IBinder.class).invoke(null, Class.forName("android.os.ServiceManager").getDeclaredMethod("getService", String.class).invoke(null, "activity"));
-            } else {
-                Class<?> activityManagerNativeClass = Class.forName("android.app.ActivityManagerNative");
-                Method getDefaultMethod = activityManagerNativeClass.getMethod("getDefault");
-                iActivityManagerObj = getDefaultMethod.invoke(activityManagerNativeClass);
+            activityManager = getActivityManager();
+            if (activityManager == null) {
+                Log.e(TAG, "could not get ActivityManager");
+                return false;
             }
 
-            // 获取 broadcastIntent 方法
-            Method broadcastIntentMethod = Class.forName("android.app.IActivityManager").getDeclaredMethod(
-                    "broadcastIntent",
-                    IApplicationThread.class,
-                    Intent.class,
-                    String.class,
-                    IIntentReceiver.class,
-                    int.class,
-                    String.class,
-                    Bundle.class,
-                    String[].class,
-                    int.class,
-                    Bundle.class,
-                    boolean.class,
-                    boolean.class,
-                    int.class
-            );
-            // 调用 broadcastIntent 方法，发送粘性广播
-            broadcastIntentMethod.invoke(
-                    iActivityManagerObj,
-                    null,
-                    intent,
-                    null,
-                    null,
-                    -1,
-                    null,
-                    null,
-                    null,
-                    0,
-                    null,
-                    false,
-                    true,
-                    -1
-            );
-
-        } catch (Exception e) {
-
+            Method broadcast = findBroadcastIntentMethod();
+            if (broadcast == null) {
+                Log.e(TAG, "could not find broadcastIntent method");
+                return false;
+            }
+            broadcast.invoke(activityManager, buildBroadcastArgs(broadcast.getParameterTypes()));
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "send binder failed", t);
             return false;
         }
-        return true;
+    }
+
+    private static Object getActivityManager() throws Exception {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Object serviceManagerBinder = Class.forName("android.os.ServiceManager")
+                    .getDeclaredMethod("getService", String.class)
+                    .invoke(null, "activity");
+            return Class.forName("android.app.IActivityManager$Stub")
+                    .getMethod("asInterface", IBinder.class)
+                    .invoke(null, serviceManagerBinder);
+        }
+        Class<?> activityManagerNative = Class.forName("android.app.ActivityManagerNative");
+        return activityManagerNative.getMethod("getDefault").invoke(null);
+    }
+
+    /**
+     * broadcastIntent 的参数在不同 Android 版本上有增减，
+     * 这里按参数类型自动填充，避免写死 13 个参数在某个版本上直接抛异常。
+     */
+    private static Method findBroadcastIntentMethod() {
+        try {
+            Class<?> clazz = Class.forName("android.app.IActivityManager");
+            Method best = null;
+            for (Method method : clazz.getDeclaredMethods()) {
+                if (!"broadcastIntent".equals(method.getName())) continue;
+                Class<?>[] types = method.getParameterTypes();
+                if (types.length < 3 || types[1] != Intent.class) continue;
+                if (best == null || types.length > best.getParameterTypes().length) {
+                    best = method;
+                }
+            }
+            return best;
+        } catch (Throwable t) {
+            Log.e(TAG, "find broadcastIntent failed", t);
+            return null;
+        }
+    }
+
+    private static Object[] buildBroadcastArgs(Class<?>[] types) {
+        int n = types.length;
+        Object[] args = new Object[n];
+        for (int i = 0; i < n; i++) {
+            Class<?> type = types[i];
+            if (type == Intent.class) {
+                args[i] = binderIntent;
+            } else if (type == int.class) {
+                if (i == n - 1) args[i] = -1;        // userId
+                else if (i == 4) args[i] = -1;       // resultCode
+                else args[i] = 0;                    // appOp
+            } else if (type == boolean.class) {
+                args[i] = (i == n - 2);              // sticky
+            } else {
+                args[i] = null;
+            }
+        }
+        return args;
     }
 
     private static boolean removeStickyBroadcast() {
-        if (intent == null || iActivityManagerObj == null) return true;
-
+        if (binderIntent == null || activityManager == null) return true;
         try {
-            // 获取 unbroadcastIntent 方法
-            Method unbroadcastIntentMethod = Class.forName("android.app.IActivityManager").getDeclaredMethod("unbroadcastIntent", IApplicationThread.class, Intent.class, int.class);
-            // 调用 broadcastIntent 方法，发送粘性广播
-            unbroadcastIntentMethod.invoke(iActivityManagerObj, null, intent, -1);
-            intent = null;
-            iActivityManagerObj = null;
-        } catch (Exception e) {
+            Class<?> clazz = Class.forName("android.app.IActivityManager");
+            Method unbroadcast = null;
+            for (Method method : clazz.getDeclaredMethods()) {
+                if (!"unbroadcastIntent".equals(method.getName())) continue;
+                Class<?>[] types = method.getParameterTypes();
+                if (types.length >= 2 && types[1] == Intent.class) {
+                    unbroadcast = method;
+                    break;
+                }
+            }
+            if (unbroadcast == null) return false;
+
+            Class<?>[] types = unbroadcast.getParameterTypes();
+            Object[] args = new Object[types.length];
+            for (int i = 0; i < types.length; i++) {
+                if (types[i] == Intent.class) args[i] = binderIntent;
+                else if (types[i] == int.class) args[i] = -1;
+                else args[i] = null;
+            }
+            unbroadcast.invoke(activityManager, args);
+            binderIntent = null;
+            activityManager = null;
+            return true;
+        } catch (Throwable t) {
             System.err.println("Failed to remove broadcast!");
             return false;
         }
-        return true;
     }
 }

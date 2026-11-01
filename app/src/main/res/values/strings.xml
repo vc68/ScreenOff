@@ -38,4 +38,10 @@
     <string name="tile">全局控制</string>
     <string name="service_closed">息屏运行服务已关闭</string>
     <string name="net_ctl">局域网控制亮灭屏</string>
+    <string name="no_network">无可用网络</string>
+    <string name="url_copied">链接已复制到剪贴板</string>
+    <string name="binder_lost">息屏服务已断开，请重新激活</string>
+    <string name="net_failed">局域网控制启动失败（端口被占用）</string>
+    <string name="active_success">激活成功</string>
+    <string name="version_info">版本 %1$s</string>
 </resources>

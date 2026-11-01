@@ -1,91 +1,54 @@
 package com.tile.screenoff;
 
-import java.util.Arrays;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 
-public class HttpRequestParser {
-    private static final byte SP = 0x20;
-    private static final byte LF = 0x0a;
-    private static final byte CR = 0x0d;
+/**
+ * 无状态的 HTTP 请求解析器。
+ * <p>
+ * 旧实现每收到一段数据都要把整个缓冲区复制一遍（O(n^2)），而且解析结果依赖实例状态。
+ * 现在改成一次性解析完整请求字节，既快也不会串包。
+ */
+public final class HttpRequestParser {
 
-    private byte[] rawData;
-
-    public HttpRequestParser() {
-        rawData = new byte[]{};
+    private HttpRequestParser() {
     }
 
-    public void add(byte[] data) {
-        byte[] newBytes = new byte[rawData.length + data.length];
-        System.arraycopy(rawData, 0, newBytes, 0, rawData.length);
-        System.arraycopy(data, 0, newBytes, rawData.length, data.length);
-        rawData = newBytes;
-    }
+    public static HttpRequest parse(byte[] raw) {
+        if (raw == null || raw.length == 0) return null;
 
-    public void clear() {
-        rawData = new byte[]{};
-    }
+        String text = new String(raw, StandardCharsets.ISO_8859_1);
+        int headerEnd = text.indexOf("\r\n\r\n");
+        String headerPart = headerEnd >= 0 ? text.substring(0, headerEnd) : text;
+        String[] lines = headerPart.split("\r\n");
+        if (lines.length == 0) return null;
 
-    public HttpRequest parse() {
-        String[] lines = splitLines(rawData);
-        if (lines == null || lines.length == 0) return null;
-        HttpRequest.StartLine startLine = parseStartLine(lines[0]);
-        if (startLine == null) return null;
-        int emptyLineNum = findEmptyLine(lines);
-        String[] headerField = Arrays.copyOfRange(lines, 1, emptyLineNum);
-        Map<String, String> headers = parseRequestHeader(headerField);
-        return new HttpRequest(startLine, headers);
-    }
+        String[] startLine = lines[0].split(" ");
+        if (startLine.length < 2) return null;
 
-    private HttpRequest.StartLine parseStartLine(String startLine) {
-        if (startLine == null) {
-            return null;
+        String method = startLine[0];
+        String target = startLine[1];
+        if (target.isEmpty()) return null;
+
+        String path = target;
+        String query = null;
+        int q = target.indexOf('?');
+        if (q >= 0) {
+            path = target.substring(0, q);
+            query = target.substring(q + 1);
         }
 
-        String[] splitLine = startLine.split(new String(new byte[]{SP}));
-        if(splitLine.length != 3) {
-            return null;
+        Map<String, String> headers = new HashMap<>();
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            if (line.isEmpty()) break;
+            int colon = line.indexOf(':');
+            if (colon <= 0) continue;
+            headers.put(line.substring(0, colon).trim().toLowerCase(java.util.Locale.US),
+                    line.substring(colon + 1).trim());
         }
 
-        return new HttpRequest.StartLine(splitLine[1]);
-    }
-
-    private Map<String, String> parseRequestHeader(String[] headerField) {
-        if(headerField == null || headerField.length == 0) {
-            return new HashMap<>();
-        }
-
-        Map<String, String> result = new HashMap<>();
-
-        for (String header : headerField) {
-            String[] splitHeader = header.split(":", 2);
-            if (splitHeader.length != 2) {
-                continue;
-            }
-            result.put(splitHeader[0], splitHeader[1].trim());
-        }
-
-        return result;
-    }
-
-    private String[] splitLines(byte[] rawData) {
-        if (rawData == null || rawData.length == 0) {
-            return null;
-        }
-        if (rawData[0] == CR || rawData[0] == LF) {
-            return null;
-        }
-
-        String dataStr = new String(rawData);
-        return dataStr.split(new String(new byte[]{CR, LF}));
-    }
-
-    private int findEmptyLine(String[] lines) {
-        for (int i = 0; i < lines.length; i++) {
-            if (lines[i].isEmpty()) {
-                return i;
-            }
-        }
-        return lines.length;
+        return new HttpRequest(method, target, path, query, headers);
     }
 }

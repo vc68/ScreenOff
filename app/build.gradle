@@ -2,6 +2,11 @@ plugins {
     id 'com.android.application'
 }
 
+// 签名信息从 gradle.properties / 环境变量读取，不再写死本机路径。
+// 没配置时自动退回 debug 签名，保证任何人都能直接 assembleRelease。
+def keystorePath = project.findProperty('SCREENOFF_KEYSTORE') ?: System.getenv('SCREENOFF_KEYSTORE')
+def hasKeystore = keystorePath != null && file(keystorePath).exists()
+
 android {
     namespace 'com.tile.screenoff'
     compileSdk 35
@@ -10,42 +15,48 @@ android {
         applicationId "com.tile.screenoff"
         minSdk 21
         targetSdk 35
-        versionCode 21
-        versionName "21"
+        versionCode 22
+        versionName "22"
         multiDexEnabled false
-        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
-        release {
-            storeFile file('D:\\key.keystore') // Keystore文件的路径
-            storePassword 'wewewe' // Keystore密码
-            keyAlias 'key0' // Key别名
-            keyPassword 'wewewe' // Key密码
+        if (hasKeystore) {
+            release {
+                storeFile file(keystorePath)
+                storePassword project.findProperty('SCREENOFF_STORE_PASSWORD') ?: System.getenv('SCREENOFF_STORE_PASSWORD')
+                keyAlias project.findProperty('SCREENOFF_KEY_ALIAS') ?: System.getenv('SCREENOFF_KEY_ALIAS')
+                keyPassword project.findProperty('SCREENOFF_KEY_PASSWORD') ?: System.getenv('SCREENOFF_KEY_PASSWORD')
+            }
         }
     }
+
     buildTypes {
         release {
-            shrinkResources false
-            signingConfig signingConfigs.release
             minifyEnabled false
+            shrinkResources false
+            signingConfig hasKeystore ? signingConfigs.release : signingConfigs.debug
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
+
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
     }
-    lintOptions {
+
+    lint {
         checkReleaseBuilds false
         abortOnError false
     }
+
     buildFeatures {
         aidl true
+        buildConfig true
     }
 }
 
 dependencies {
-
-    implementation "dev.rikka.shizuku:api:13.1.0"
-    implementation "dev.rikka.shizuku:provider:13.1.0"
+    implementation "dev.rikka.shizuku:api:13.1.5"
+    implementation "dev.rikka.shizuku:provider:13.1.5"
 }
