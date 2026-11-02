@@ -17,6 +17,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.RemoteException;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -55,12 +56,24 @@ public class GlobalService extends AccessibilityService implements SharedPrefere
     private static final int DEFAULT_PORT = 20000;
     private static final int PORT_TRY_COUNT = 10;
 
+    /**
+     * 保活自检间隔。
+     * 息屏运行期间，系统（尤其是国产 ROM 的省电策略）随时可能回收我们的 overlay 窗口，
+     * 窗口一掉 FLAG_KEEP_SCREEN_ON 就失效，系统会按「休眠超时」真正睡死。
+     * 所以必须周期性检查并重建。
+     */
+    private static final long KEEPALIVE_CHECK_MS = 15000L;
+
+    /** 记录用户「想要」处于息屏运行状态，无障碍服务被回收重启后据此自动恢复。 */
+    private static final String KEY_WANT_SPECIAL = "want_special";
+
     private WindowManager windowManager;
     private WindowManager.LayoutParams params;
     private ImageView view;
     private View keepAliveView;
     private WindowManager.LayoutParams keepAliveParams;
     private boolean keepAliveAttached;
+    private boolean keepAliveWatchRunning;
     private SharedPreferences sp;
     private boolean exist = false, canmove, doubleTap, shake, volume, netControl, onlyLand;
     private int size, sensity, scrOnKey, scrOffKey;
@@ -97,10 +110,36 @@ public class GlobalService extends AccessibilityService implements SharedPrefere
                     iScreenOff = IScreenOff.Stub.asInterface(binder);
                     // 服务重新连上后把悬浮球恢复到正确状态
                     if (exist) windowManager.updateViewLayout(view, params);
+                    // 控制器进程可能重启过（内存里的状态会回到 STATE_ON），
+                    // 只要用户之前要的是「息屏运行」，这里重新下发一次，保证状态机一致。
+                    restoreIfWanted();
                     break;
                 }
                 case Intent.ACTION_SCREEN_OFF: {
                     IScreenOff api = iScreenOff;
+                    int now = -1;
+                    if (api != null) {
+                        try {
+                            now = api.getNowScreenState();
+                        } catch (RemoteException e) {
+                            onBinderLost();
+                        }
+                    }
+                    // 关键区分：
+                    //   isInteractive()==true  → 设备还醒着，只是我们的保活窗口被系统回收了
+                    //                            （国产 ROM 省电清理、锁屏切换都会触发）。
+                    //                            此时绝对不能撤保活，必须立刻重建，否则接着就真睡死。
+                    //   isInteractive()==false → 用户按了电源键 / 系统真的休眠，应当老实退出息屏运行。
+                    if (now == STATE_SPECIAL && isInteractive()) {
+                        rememberState(STATE_SPECIAL);
+                        // 状态仍是息屏运行，说明用户要的就是这个，标记也要对齐，
+                        // 否则心跳会因为 want_special=false 直接退出，失去自愈能力。
+                        setWantSpecial(true);
+                        ensureKeepAlive();
+                        startKeepAliveWatch();
+                        break;
+                    }
+                    // 设备真的进入睡眠：退出息屏运行，交还系统控制
                     if (api != null) {
                         try {
                             api.updateNowScreenState(false);
@@ -109,19 +148,27 @@ public class GlobalService extends AccessibilityService implements SharedPrefere
                         }
                     }
                     rememberState(STATE_OFF);
-                    setKeepAwake(false);
+                    setWantSpecial(false);
+                    releaseKeepAlive();
+                    stopKeepAliveWatch();
                     if (shake) listener.disable();
                     break;
                 }
                 case Intent.ACTION_SCREEN_ON:
                 case Intent.ACTION_USER_PRESENT: {
                     IScreenOff api = iScreenOff;
-                    if (api != null) {
-                        try {
-                            api.updateNowScreenState(true);
-                        } catch (RemoteException e) {
-                            onBinderLost();
+                    if (api == null) break;
+                    try {
+                        if (api.getNowScreenState() == STATE_SPECIAL) {
+                            // 息屏运行中：SurfaceControl 层屏幕仍是关的，
+                            // 这里收到亮屏广播不要破坏状态机，只补一次保活。
+                            ensureKeepAlive();
+                            startKeepAliveWatch();
+                            break;
                         }
+                        api.updateNowScreenState(true);
+                    } catch (RemoteException e) {
+                        onBinderLost();
                     }
                     rememberState(STATE_ON);
                     break;
@@ -133,6 +180,10 @@ public class GlobalService extends AccessibilityService implements SharedPrefere
                     toggle();
                     break;
                 case ACTION_EXIT:
+                    // 用户主动退出：清掉「想要息屏运行」的标记，避免服务重启后又自动关屏
+                    setWantSpecial(false);
+                    stopKeepAliveWatch();
+                    releaseKeepAlive();
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                         disableSelf();
                     } else {
@@ -239,12 +290,23 @@ public class GlobalService extends AccessibilityService implements SharedPrefere
         view.setImageResource(R.drawable.fw);
 
         keepAliveView = new View(this);
-        keepAliveParams = new WindowManager.LayoutParams(1, 1,
+        // 必须是全屏窗口：1x1 的小窗口在不少 ROM 上不会被 PowerManagerService 认定为
+        // 「持有屏幕」的窗口，FLAG_KEEP_SCREEN_ON 形同虚设，系统照常按超时休眠。
+        // 全屏 + 不可触摸 + 全透明，用户完全感知不到，但保活一定生效。
+        keepAliveParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
                 Build.VERSION.SDK_INT >= 22 ? WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY : WindowManager.LayoutParams.TYPE_SYSTEM_ERROR,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                        | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED,
+                        | WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            keepAliveParams.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
 
         canmove = sp.getBoolean("canmove", true);
         doubleTap = sp.getBoolean("doubleTap", false);
@@ -280,6 +342,10 @@ public class GlobalService extends AccessibilityService implements SharedPrefere
         receiverRegistered = true;
 
         sp.registerOnSharedPreferenceChangeListener(this);
+
+        // 无障碍服务可能被系统回收后重启：如果用户之前要的是「息屏运行」，
+        // 这里必须把保活和状态一起恢复，否则手机会直接睡死。
+        restoreIfWanted();
     }
 
     private int dpToPx(int dp) {
@@ -362,41 +428,163 @@ public class GlobalService extends AccessibilityService implements SharedPrefere
         params.y = Math.max(-maxY, Math.min(maxY, params.y));
     }
 
-    /** 不依赖悬浮球也能保持系统不自动休眠（旧版本关掉悬浮球后息屏运行会被系统睡死）。 */
-    private void setKeepAwake(boolean on) {
-        if (windowManager == null) return;
+    /**
+     * 建立（或重建）保活窗口。
+     * <p>
+     * 旧版本只在开关屏那一刻挂一次窗口，之后再不检查。一旦系统在息屏后回收了这个
+     * overlay（国产 ROM 的省电清理、锁屏切换、旋转等都会触发），FLAG_KEEP_SCREEN_ON
+     * 就彻底失效，手机会按系统休眠超时真正睡死 —— 这正是「刚开始好好的，过一会儿
+     * 自己熄屏了」的原因。
+     * <p>
+     * 现在改成幂等操作：无论调用多少次、窗口是否还在，都保证最终有一个活着的
+     * keep-screen-on 窗口。配合心跳自检，可以自愈。
+     */
+    private void ensureKeepAlive() {
+        if (windowManager == null || keepAliveView == null) return;
         try {
-            if (on) {
-                if (!keepAliveAttached) {
-                    windowManager.addView(keepAliveView, keepAliveParams);
-                    keepAliveAttached = true;
-                }
-                keepAliveView.setKeepScreenOn(true);
-            } else {
+            if (keepAliveView.getParent() == null) {
                 if (keepAliveAttached) {
-                    keepAliveView.setKeepScreenOn(false);
-                    windowManager.removeViewImmediate(keepAliveView);
+                    // 记录说挂着、实际已经掉了，先清掉脏状态
+                    try {
+                        windowManager.removeViewImmediate(keepAliveView);
+                    } catch (Exception ignored) {
+                    }
                     keepAliveAttached = false;
                 }
+                windowManager.addView(keepAliveView, keepAliveParams);
+                keepAliveAttached = true;
             }
+            keepAliveView.setKeepScreenOn(true);
         } catch (Exception e) {
-            Log.w(TAG, "setKeepAwake failed", e);
+            Log.w(TAG, "ensureKeepAlive failed", e);
             keepAliveAttached = false;
         }
     }
 
+    /** 撤掉保活窗口，让系统恢复正常的休眠计时。 */
+    private void releaseKeepAlive() {
+        if (windowManager == null || keepAliveView == null) return;
+        try {
+            keepAliveView.setKeepScreenOn(false);
+            if (keepAliveView.getParent() != null) {
+                windowManager.removeViewImmediate(keepAliveView);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "releaseKeepAlive failed", e);
+        } finally {
+            keepAliveAttached = false;
+        }
+    }
+
+    /** 心跳：只要用户还要「息屏运行」，就周期性确认保活窗口活着。 */
+    private final Runnable keepAliveCheck = new Runnable() {
+        @Override
+        public void run() {
+            // 正在跑的时候置位，避免下面的 restoreIfWanted() 再排一次，造成心跳翻倍
+            keepAliveWatchRunning = true;
+            boolean want = sp != null && sp.getBoolean(KEY_WANT_SPECIAL, false);
+            if (!want) {
+                keepAliveWatchRunning = false;
+                return; // 用户已退出，停止排队
+            }
+            if (isSpecialState()) {
+                ensureKeepAlive();
+            } else if (iScreenOff != null) {
+                // 状态被意外重置（控制器重启、系统唤醒等），重新拉回息屏运行
+                restoreIfWanted();
+            }
+            handler.removeCallbacks(this);
+            handler.postDelayed(this, KEEPALIVE_CHECK_MS);
+        }
+    };
+
+    private void startKeepAliveWatch() {
+        if (keepAliveWatchRunning) return;
+        keepAliveWatchRunning = true;
+        handler.removeCallbacks(keepAliveCheck);
+        handler.postDelayed(keepAliveCheck, KEEPALIVE_CHECK_MS);
+    }
+
+    private void stopKeepAliveWatch() {
+        keepAliveWatchRunning = false;
+        handler.removeCallbacks(keepAliveCheck);
+    }
+
+    private boolean isInteractive() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Service.POWER_SERVICE);
+            return pm == null || pm.isInteractive();
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    private boolean isSpecialState() {
+        IScreenOff api = iScreenOff;
+        if (api == null) return false;
+        try {
+            return api.getNowScreenState() == STATE_SPECIAL;
+        } catch (RemoteException e) {
+            onBinderLost();
+            return false;
+        }
+    }
+
+    /** 用户之前要求「息屏运行」，但服务/控制器重连过，就把状态重新拉回来。 */
+    private void restoreIfWanted() {
+        if (sp == null || !sp.getBoolean(KEY_WANT_SPECIAL, false)) return;
+        if (iScreenOff == null) return; // 等粘性广播把 Binder 送过来再恢复
+        if (isSpecialState()) {
+            ensureKeepAlive();
+            startKeepAliveWatch();
+            return;
+        }
+        screenOff(true);
+    }
+
+    private void setWantSpecial(boolean want) {
+        if (sp != null) sp.edit().putBoolean(KEY_WANT_SPECIAL, want).apply();
+    }
+
     void screenOff(boolean off) {
         IScreenOff api = iScreenOff;
-        if (api == null) return;
+        if (api == null) {
+            handler.post(() -> Toast.makeText(GlobalService.this, R.string.binder_lost, Toast.LENGTH_SHORT).show());
+            return;
+        }
         try {
-            // 0 = 用户真的按了电源键息屏，此时不需要（也不能）再做任何事
-            if (api.getNowScreenState() == STATE_OFF) return;
-            api.setPowerMode(off);
-            rememberState(off ? STATE_SPECIAL : STATE_ON);
-            setKeepAwake(off);
-            if (shake) {
-                if (off) listener.enable();
-                else listener.disable();
+            final int now = api.getNowScreenState();
+            if (off) {
+                // 0 = 用户真的按了电源键息屏，此时不需要（也不能）再做任何事
+                if (now == STATE_OFF) return;
+                if (now == STATE_SPECIAL) {
+                    // 已经在息屏运行，重复触发只刷新保活，不要重复下发关屏
+                    setWantSpecial(true);
+                    ensureKeepAlive();
+                    startKeepAliveWatch();
+                    return;
+                }
+                api.setPowerMode(true);
+                rememberState(STATE_SPECIAL);
+                setWantSpecial(true);
+                ensureKeepAlive();
+                startKeepAliveWatch();
+                if (shake) listener.enable();
+            } else {
+                if (now == STATE_ON) {
+                    // 本来就是亮的，顺手把可能残留的保活撤掉
+                    rememberState(STATE_ON);
+                    setWantSpecial(false);
+                    releaseKeepAlive();
+                    stopKeepAliveWatch();
+                    return;
+                }
+                api.setPowerMode(false);
+                rememberState(STATE_ON);
+                setWantSpecial(false);
+                releaseKeepAlive();
+                stopKeepAliveWatch();
+                if (shake) listener.disable();
             }
         } catch (RemoteException e) {
             onBinderLost();
@@ -504,7 +692,9 @@ public class GlobalService extends AccessibilityService implements SharedPrefere
             }
             receiverRegistered = false;
         }
-        setKeepAwake(false);
+        stopKeepAliveWatch();
+        releaseKeepAlive();
+        // 注意：不清 want_special。服务被系统回收后如果还能重启，要靠它恢复息屏运行。
         try {
             if (exist) windowManager.removeViewImmediate(view);
         } catch (Exception ignored) {

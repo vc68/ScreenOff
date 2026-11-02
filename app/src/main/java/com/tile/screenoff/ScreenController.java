@@ -5,6 +5,7 @@ import android.content.IIntentReceiver;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.RemoteException;
@@ -24,6 +25,7 @@ public class ScreenController {
 
     private static final String TAG = "ScreenOff";
     private static final String ACTION_SEND_BINDER = "intent.screenoff.sendBinder";
+    private static final long WATCHDOG_INTERVAL_MS = 20000L;
 
     public enum ScreenState {
         STATE_OFF, STATE_ON, STATE_SPECIAL
@@ -124,18 +126,32 @@ public class ScreenController {
             System.err.println("Could not get display token.");
             return false;
         }
-        if (turnOff) {
-            if (screenState == ScreenState.STATE_ON) {
-                if (!setDisplayPowerMode(token, POWER_MODE_OFF)) return false;
-                screenState = ScreenState.STATE_SPECIAL;
-            }
-        } else {
-            if (screenState == ScreenState.STATE_SPECIAL) {
-                if (!setDisplayPowerMode(token, POWER_MODE_NORMAL)) return false;
-                screenState = ScreenState.STATE_ON;
-            }
-        }
+        // 不再用内存里的 screenState 做前置判断。
+        // 控制器进程一旦重启，screenState 会回到 STATE_ON，而物理屏幕其实还是关的，
+        // 旧逻辑下「点亮屏」会因为状态不匹配而什么都不做，用户只能按电源键。
+        // setDisplayPowerMode 本身幂等，直接下发最稳。
+        if (!setDisplayPowerMode(token, turnOff ? POWER_MODE_OFF : POWER_MODE_NORMAL)) return false;
+        screenState = turnOff ? ScreenState.STATE_SPECIAL : ScreenState.STATE_ON;
         return true;
+    }
+
+    /**
+     * 看门狗：息屏运行期间周期性重申 POWER_MODE_OFF。
+     * 系统（通知唤醒、DPC 重新评估、厂商策略）可能把 display 又点亮，
+     * 只靠一次性下发会出现「过一会儿屏幕自己亮/自己灭」的抖动。
+     */
+    private static void startWatchdog() {
+        final Handler handler = new Handler(Looper.getMainLooper());
+        handler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (screenState == ScreenState.STATE_SPECIAL) {
+                    IBinder token = getDisplayToken();
+                    if (token != null) setDisplayPowerMode(token, POWER_MODE_OFF);
+                }
+                handler.postDelayed(this, WATCHDOG_INTERVAL_MS);
+            }
+        }, WATCHDOG_INTERVAL_MS);
     }
 
     // ------------------------------------------------------------------ 入口
@@ -179,6 +195,8 @@ public class ScreenController {
             System.exit(-1);
             return;
         }
+
+        startWatchdog();
 
         Runtime.getRuntime().addShutdownHook(new Thread() {
             @Override

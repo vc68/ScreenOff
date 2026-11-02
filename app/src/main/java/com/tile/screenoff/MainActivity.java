@@ -363,14 +363,11 @@ public class MainActivity extends Activity {
         ScrollView scrollView = findViewById(R.id.sv);
         Switch aSwitch = findViewById(R.id.screenoff_switch);
         aSwitch.setOnCheckedChangeListener((compoundButton, b) -> {
-            if (!isServiceOK || updatingSwitch || iScreenOff == null) return;
-            try {
-                iScreenOff.setPowerMode(!b);
-            } catch (RemoteException e) {
-                iScreenOff = null;
-                isServiceOK = false;
-                Toast.makeText(this, R.string.binder_lost, Toast.LENGTH_SHORT).show();
-            }
+            if (!isServiceOK || updatingSwitch) return;
+            // 统一走无障碍服务的开关屏逻辑：
+            // 旧代码直接调 iScreenOff.setPowerMode()，绕过了保活窗口，
+            // 结果从这里关屏后手机会按系统休眠超时真正睡死。
+            sendBroadcast(new Intent(GlobalService.ACTION_SCR_OFF).putExtra("state", b));
         });
 
         ImageView imageView = findViewById(R.id.iv);
